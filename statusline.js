@@ -105,14 +105,26 @@ async function updateAndGetMonthlyTotal(sessionId, costUsd) {
       if (entry.date >= cutoffStr) sessions[id] = entry;
     }
 
-    // Monotonic cost: if the incoming cost is lower than what we cached,
-    // /clear (or equivalent) reset the session counter. Add the new
-    // post-clear accumulation on top so no spend is lost.
+    // Delta-based accumulation with /clear detection.
+    //
+    // `lastCostUsd` is the raw payload value we saw on the previous refresh.
+    // On each refresh we add only the INCREMENT (costUsd - lastCostUsd) to the
+    // running total, not the full value — so the cache does not double-count.
+    //
+    // When costUsd < lastCostUsd the session was reset (/clear or restart).
+    // We treat costUsd itself as the first delta from a new zero baseline and
+    // add it in full, then resume delta tracking from there.
     const existing = sessions[sessionId];
-    const newCost = existing && costUsd < existing.cost
-      ? existing.cost + costUsd
-      : costUsd;
-    sessions[sessionId] = { cost: newCost, date: today };
+    const lastKnown = existing?.lastCostUsd ?? existing?.cost ?? 0;
+    let newCost;
+    if (!existing) {
+      newCost = costUsd;                          // first observation
+    } else if (costUsd >= lastKnown) {
+      newCost = existing.cost + (costUsd - lastKnown); // normal delta
+    } else {
+      newCost = existing.cost + costUsd;          // reset: add post-clear total
+    }
+    sessions[sessionId] = { cost: newCost, lastCostUsd: costUsd, date: today };
     data.sessions = sessions;
 
     // Compute monthly total before writing (so a write failure still returns a value)
