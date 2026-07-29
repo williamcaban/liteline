@@ -62,7 +62,7 @@ on every compaction event. Sidechain (subagent) entries are excluded.
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/williamcaban/liteline.git ~/liteline
+git clone https://github.com/williamcaban/liteline.git
 ```
 
 Or place it anywhere you like — the path you choose goes into settings in the
@@ -71,7 +71,7 @@ next step.
 ### 2. Make the script executable
 
 ```bash
-chmod +x ~/liteline/statusline.js
+chmod +x liteline/statusline.js
 ```
 
 ### 3. Add to Claude Code settings
@@ -89,9 +89,9 @@ Open `~/.claude/settings.json` (create it if it does not exist) and add:
 }
 ```
 
-Replace `/absolute/path/to/liteline` with the actual path where you cloned the
-repo. Use an absolute path — Claude Code may invoke the command from any working
-directory.
+Replace `/absolute/path/to/liteline` with the full path to the directory where
+you cloned the repo. Use an absolute path — Claude Code may invoke the command
+from any working directory.
 
 `refreshInterval` is in seconds. `10` is a good default; lower values refresh
 faster but run the script more often.
@@ -211,4 +211,6 @@ status line tools:
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) for the full text.
+
+Copyright 2026 William Caban
