@@ -72,6 +72,58 @@ async function readStdin() {
   return chunks.join('');
 }
 
+// Upsert this session's cost into ~/.cache/liteline/costs.json and return
+// the running total for the current calendar month.
+// Cache schema: { sessions: { [id]: { cost, date } } }
+// Sessions older than 60 days are pruned on each write.
+async function updateAndGetMonthlyTotal(sessionId, costUsd) {
+  if (!sessionId || costUsd == null) return null;
+  try {
+    const { existsSync, mkdirSync, readFileSync, writeFileSync } = await import('fs');
+    const { homedir } = await import('os');
+    const { join } = await import('path');
+
+    const cacheDir  = join(homedir(), '.cache', 'liteline');
+    const cacheFile = join(cacheDir, 'costs.json');
+    const today     = new Date().toISOString().slice(0, 10);   // YYYY-MM-DD
+    const thisMonth = today.slice(0, 7);                        // YYYY-MM
+    const cutoff    = new Date();
+    cutoff.setDate(cutoff.getDate() - 60);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+    // Read existing cache
+    let data = { sessions: {} };
+    if (existsSync(cacheFile)) {
+      try { data = JSON.parse(readFileSync(cacheFile, 'utf8')); }
+      catch { /* start fresh on corrupt cache */ }
+      if (!data?.sessions) data = { sessions: {} };
+    }
+
+    // Upsert current session and prune old entries in one pass
+    const sessions = {};
+    for (const [id, entry] of Object.entries(data.sessions)) {
+      if (entry.date >= cutoffStr) sessions[id] = entry;
+    }
+    sessions[sessionId] = { cost: costUsd, date: today };
+    data.sessions = sessions;
+
+    // Compute monthly total before writing (so a write failure still returns a value)
+    const monthly = Object.values(sessions)
+      .filter(e => e.date.startsWith(thisMonth))
+      .reduce((sum, e) => sum + (e.cost ?? 0), 0);
+
+    // Write cache (best-effort)
+    try {
+      if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+      writeFileSync(cacheFile, JSON.stringify(data));
+    } catch { /* ignore write errors */ }
+
+    return monthly;
+  } catch {
+    return null;
+  }
+}
+
 // Stream JSONL transcript and count compact_boundary markers.
 // Format: {type:'system', subtype:'compact_boundary', isSidechain: !true}
 async function getCompactionCount(transcriptPath) {
@@ -118,8 +170,9 @@ function formatRateWindow(window, label) {
     process.exit(1);
   }
 
-  // Kick off compaction count concurrently while formatting everything else.
+  // Kick off async work concurrently while formatting everything else.
   const compactionPromise = getCompactionCount(d.transcript_path);
+  const monthlyPromise    = updateAndGetMonthlyTotal(d.session_id, d.cost?.total_cost_usd);
 
   const SEP  = `${DIM} │ ${RESET}`;   // within-segment separator
   const SSEP = `${DIM} ║ ${RESET}`;   // between-segment separator
@@ -131,7 +184,11 @@ function formatRateWindow(window, label) {
   if (model) session.push(`${CYAN}${model}${RESET}`);
 
   const cost = formatCost(d.cost?.total_cost_usd);
-  if (cost) session.push(`${YELLOW}${BOLD}${cost}${RESET}`);
+  const monthly = await monthlyPromise;
+  if (cost) {
+    const monthlyStr = monthly != null ? `${DIM} (~${formatCost(monthly)}/mo)${RESET}` : '';
+    session.push(`${YELLOW}${BOLD}${cost}${RESET}${monthlyStr}`);
+  }
 
   const pct = d.context_window?.used_percentage;
   if (pct != null) session.push(`${pctColor(pct)}${pct}%${RESET}${DIM} ctx${RESET}`);
