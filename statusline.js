@@ -104,7 +104,15 @@ async function updateAndGetMonthlyTotal(sessionId, costUsd) {
     for (const [id, entry] of Object.entries(data.sessions)) {
       if (entry.date >= cutoffStr) sessions[id] = entry;
     }
-    sessions[sessionId] = { cost: costUsd, date: today };
+
+    // Monotonic cost: if the incoming cost is lower than what we cached,
+    // /clear (or equivalent) reset the session counter. Add the new
+    // post-clear accumulation on top so no spend is lost.
+    const existing = sessions[sessionId];
+    const newCost = existing && costUsd < existing.cost
+      ? existing.cost + costUsd
+      : costUsd;
+    sessions[sessionId] = { cost: newCost, date: today };
     data.sessions = sessions;
 
     // Compute monthly total before writing (so a write failure still returns a value)
