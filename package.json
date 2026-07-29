@@ -1,10 +1,10 @@
 {
-  "name": "cc-statusline",
+  "name": "liteline",
   "version": "0.1.0",
   "description": "Minimal Claude Code status line — cost, context, tokens. No external deps.",
   "type": "module",
   "bin": {
-    "cc-statusline": "./statusline.js"
+    "liteline": "./statusline.js"
   },
   "engines": {
     "node": ">=18"
