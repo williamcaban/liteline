@@ -16,6 +16,13 @@
 // liteline — Claude Code status line
 // Cost, context, tokens, rate limits, compaction. No external dependencies.
 
+// #11 — top-level imports (visible dependencies, no per-call overhead)
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { homedir } from 'os';
+import { join }    from 'path';
+import { createInterface } from 'readline';
+
+// ── ANSI ────────────────────────────────────────────────────────────────────
 const RESET   = '\x1b[0m';
 const DIM     = '\x1b[2m';
 const BOLD    = '\x1b[1m';
@@ -31,36 +38,41 @@ function pctColor(pct) {
   return GREEN;
 }
 
+// #10 — guard against negative cost (corrupted payload or API quirk)
 function formatCost(usd) {
-  if (usd == null) return null;
+  if (usd == null || usd < 0) return null;
   if (usd < 0.001) return `<$0.001`;
   if (usd < 0.01)  return `$${usd.toFixed(3)}`;
   return `$${usd.toFixed(2)}`;
 }
 
-function formatDuration(ms) {
-  if (!ms || ms <= 0) return null;
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
+// #2, #6 — shared seconds-to-human formatter used by both formatDuration and
+// formatCountdown, eliminating the duplicate tier logic and the Math.ceil
+// artifact that could produce "60m".
+//
+// showSecs : include seconds in the sub-hour tier (duration) vs minutes only (countdown)
+// zeroStr  : return value when s <= 0 (null for duration, 'now' for countdown)
+function _secsToHuman(s, showSecs, zeroStr) {
+  if (s <= 0) return zeroStr;
+  if (s < 60)  return showSecs ? `${s}s` : `1m`;
   const m = Math.floor(s / 60);
-  if (m < 60) { const rs = s % 60; return rs > 0 ? `${m}m${rs}s` : `${m}m`; }
-  const h = Math.floor(m / 60);
-  if (h < 24) { const rm = m % 60; return rm > 0 ? `${h}h${rm}m` : `${h}h`;  }
-  const d = Math.floor(h / 24); const rh = h % 24;
+  if (m < 60) {
+    if (showSecs) { const rs = s % 60; return rs > 0 ? `${m}m${rs}s` : `${m}m`; }
+    return `${m}m`;
+  }
+  const h  = Math.floor(m / 60); const rm = m % 60;
+  if (h < 24) return rm > 0 ? `${h}h${rm}m` : `${h}h`;
+  const d  = Math.floor(h / 24); const rh = h % 24;
   return rh > 0 ? `${d}d${rh}h` : `${d}d`;
 }
 
-function formatCountdown(seconds) {
-  if (seconds <= 0) return 'now';
-  if (seconds < 3600) return `${Math.ceil(seconds / 60)}m`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (h >= 24) {
-    const d = Math.floor(h / 24);
-    const rh = h % 24;
-    return rh > 0 ? `${d}d${rh}h` : `${d}d`;
-  }
-  return m > 0 ? `${h}h${m}m` : `${h}h`;
+function formatDuration(ms) {
+  if (!ms || ms <= 0) return null;
+  return _secsToHuman(Math.floor(ms / 1000), true, null);
+}
+
+function formatCountdown(secs) {
+  return _secsToHuman(Math.floor(secs), false, 'now');
 }
 
 function shortModel(name) {
@@ -75,113 +87,113 @@ async function readStdin() {
   return chunks.join('');
 }
 
-// Upsert this session's cost into ~/.cache/liteline/costs.json and return
-// the running total for the current calendar month.
-// Cache schema: { sessions: { [id]: { cost, date } } }
-// Sessions older than 60 days are pruned on each write.
-async function updateAndGetMonthlyTotal(sessionId, costUsd) {
-  if (!sessionId || costUsd == null) return null;
-  try {
-    const { existsSync, mkdirSync, readFileSync, writeFileSync } = await import('fs');
-    const { homedir } = await import('os');
-    const { join } = await import('path');
+// ── Monthly cost cache ──────────────────────────────────────────────────────
+// #9 — allow override via env var for testing or non-standard setups
+const CACHE_DIR  = process.env.LITELINE_CACHE_DIR ?? join(homedir(), '.cache', 'liteline');
+const CACHE_FILE = join(CACHE_DIR, 'costs.json');
 
-    const cacheDir  = join(homedir(), '.cache', 'liteline');
-    const cacheFile = join(cacheDir, 'costs.json');
-    const today     = new Date().toISOString().slice(0, 10);   // YYYY-MM-DD
-    const thisMonth = today.slice(0, 7);                        // YYYY-MM
+// #1 — separated read/write; retry once to tolerate a concurrent rename landing
+// between our open() and read(). Returns a guaranteed-valid structure.
+function readCache() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+      if (data && typeof data.sessions === 'object') return data;
+    } catch { /* retry */ }
+  }
+  return { sessions: {} };
+}
+
+// #1 — atomic write: write to a PID-unique temp file then rename.
+// On POSIX, rename(2) is atomic: concurrent readers see the old or new file,
+// never a partial write. PID in the name prevents two writers clobbering each
+// other's temp file (last rename wins — a lost update, not corruption).
+function writeCache(data) {
+  const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
+  try {
+    if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(tmp, JSON.stringify(data));
+    renameSync(tmp, CACHE_FILE);
+  } catch { /* stale cache is better than a crash */ }
+}
+
+async function updateAndGetMonthlyTotal(sessionId, costUsd) {
+  if (!sessionId || costUsd == null || costUsd < 0) return null;
+  try {
+    const today     = new Date().toISOString().slice(0, 10);  // YYYY-MM-DD
+    const month     = today.slice(0, 7);                       // YYYY-MM
     const cutoff    = new Date();
     cutoff.setDate(cutoff.getDate() - 60);
     const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-    // Read existing cache
-    let data = { sessions: {} };
-    if (existsSync(cacheFile)) {
-      try { data = JSON.parse(readFileSync(cacheFile, 'utf8')); }
-      catch { /* start fresh on corrupt cache */ }
-      if (!data?.sessions) data = { sessions: {} };
-    }
+    const data = readCache();
 
-    // Upsert current session and prune old entries in one pass
+    // #4 — prune + validate in one pass: drop old and corrupt entries
     const sessions = {};
-    for (const [id, entry] of Object.entries(data.sessions)) {
-      if (entry.date >= cutoffStr) sessions[id] = entry;
+    for (const [id, e] of Object.entries(data.sessions ?? {})) {
+      if (typeof e?.cost === 'number' && isFinite(e.cost)
+          && typeof e?.date === 'string' && e.date >= cutoffStr) {
+        sessions[id] = e;
+      }
     }
 
-    // Delta-based accumulation with /clear detection.
-    //
-    // `lastCostUsd` is the raw payload value we saw on the previous refresh.
-    // On each refresh we add only the INCREMENT (costUsd - lastCostUsd) to the
-    // running total, not the full value — so the cache does not double-count.
-    //
-    // When costUsd < lastCostUsd the session was reset (/clear or restart).
-    // We treat costUsd itself as the first delta from a new zero baseline and
-    // add it in full, then resume delta tracking from there.
-    const existing = sessions[sessionId];
+    // Delta-based accumulation with /clear detection (see earlier commit)
+    const existing  = sessions[sessionId];
     const lastKnown = existing?.lastCostUsd ?? existing?.cost ?? 0;
-    let newCost;
-    if (!existing) {
-      newCost = costUsd;                          // first observation
-    } else if (costUsd >= lastKnown) {
-      newCost = existing.cost + (costUsd - lastKnown); // normal delta
-    } else {
-      newCost = existing.cost + costUsd;          // reset: add post-clear total
-    }
+    const newCost   = !existing            ? costUsd
+                    : costUsd >= lastKnown ? existing.cost + (costUsd - lastKnown)
+                    :                        existing.cost + costUsd;
     sessions[sessionId] = { cost: newCost, lastCostUsd: costUsd, date: today };
-    data.sessions = sessions;
 
-    // Compute monthly total before writing (so a write failure still returns a value)
     const monthly = Object.values(sessions)
-      .filter(e => e.date.startsWith(thisMonth))
-      .reduce((sum, e) => sum + (e.cost ?? 0), 0);
+      .filter(e => e.date.startsWith(month))
+      .reduce((sum, e) => sum + e.cost, 0);
 
-    // Write cache (best-effort)
-    try {
-      if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-      writeFileSync(cacheFile, JSON.stringify(data));
-    } catch { /* ignore write errors */ }
-
+    writeCache({ sessions });
     return monthly;
   } catch {
     return null;
   }
 }
 
-// Stream JSONL transcript and count compact_boundary markers.
-// Format: {type:'system', subtype:'compact_boundary', isSidechain: !true}
+// ── Compaction counter ──────────────────────────────────────────────────────
+// #5 — 2 s timeout so a large transcript never stalls the status bar
 async function getCompactionCount(transcriptPath) {
   if (!transcriptPath) return 0;
-  try {
-    const { createReadStream } = await import('fs');
-    const { createInterface } = await import('readline');
-    const rl = createInterface({ input: createReadStream(transcriptPath), crlfDelay: Infinity });
-    let count = 0;
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      try {
-        const e = JSON.parse(line);
-        if (e.type === 'system' && e.subtype === 'compact_boundary' && e.isSidechain !== true) count++;
-      } catch { /* skip malformed lines */ }
-    }
-    return count;
-  } catch {
-    return 0;
-  }
+
+  const scan = async () => {
+    try {
+      const rl = createInterface({ input: createReadStream(transcriptPath), crlfDelay: Infinity });
+      let count = 0;
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        try {
+          const e = JSON.parse(line);
+          if (e.type === 'system' && e.subtype === 'compact_boundary' && e.isSidechain !== true) count++;
+        } catch { /* skip malformed lines */ }
+      }
+      return count;
+    } catch { return 0; }
+  };
+
+  return Promise.race([scan(), new Promise(r => setTimeout(() => r(0), 2000))]);
 }
 
-// Format one rate-limit window: "5h:42% ↺2h15m"
-function formatRateWindow(window, label) {
-  if (!window) return null;
-  const pct = window.used_percentage;
+// ── Rate limit window ───────────────────────────────────────────────────────
+// #8 — renamed parameter: 'window' → 'bucket' (avoids shadowing global identifier)
+function formatRateWindow(bucket, label) {
+  if (!bucket) return null;
+  const pct = bucket.used_percentage;
   if (pct == null) return null;
   let s = `${DIM}${label}:${RESET}${pctColor(pct)}${pct}%${RESET}`;
-  if (window.resets_at) {
-    const remaining = window.resets_at - Math.floor(Date.now() / 1000);
+  if (bucket.resets_at) {
+    const remaining = bucket.resets_at - Math.floor(Date.now() / 1000);
     s += `${DIM} ↺${formatCountdown(remaining)}${RESET}`;
   }
   return s;
 }
 
+// ── Main ────────────────────────────────────────────────────────────────────
 (async () => {
   let raw;
   try { raw = await readStdin(); } catch { process.exit(1); }
@@ -193,23 +205,27 @@ function formatRateWindow(window, label) {
     process.exit(1);
   }
 
-  // Kick off async work concurrently while formatting everything else.
-  const compactionPromise = getCompactionCount(d.transcript_path);
-  const monthlyPromise    = updateAndGetMonthlyTotal(d.session_id, d.cost?.total_cost_usd);
+  // #7 — both async tasks start concurrently; single await collects both results
+  const [compactions, monthly] = await Promise.all([
+    getCompactionCount(d.transcript_path),
+    updateAndGetMonthlyTotal(d.session_id, d.cost?.total_cost_usd),
+  ]);
 
-  const SEP  = `${DIM} │ ${RESET}`;   // within-segment separator
-  const SSEP = `${DIM} ║ ${RESET}`;   // between-segment separator
+  const SEP  = `${DIM} │ ${RESET}`;
+  const SSEP = `${DIM} ║ ${RESET}`;
 
-  // ── Session segment ────────────────────────────────────────────────
+  // ── Session segment ────────────────────────────────────────────────────
   const session = [];
 
   const model = shortModel(d.model?.display_name ?? d.model?.id);
   if (model) session.push(`${CYAN}${model}${RESET}`);
 
   const cost = formatCost(d.cost?.total_cost_usd);
-  const monthly = await monthlyPromise;
   if (cost) {
-    const monthlyStr = monthly != null ? `${DIM} (~${formatCost(monthly)}/mo)${RESET}` : '';
+    // #3 — suppress monthly when negligible (avoids "~<$0.001/mo" on session start)
+    const monthlyStr = (monthly != null && monthly >= 0.001)
+      ? `${DIM} (~${formatCost(monthly)}/mo)${RESET}`
+      : '';
     session.push(`${YELLOW}${BOLD}${cost}${RESET}${monthlyStr}`);
   }
 
@@ -229,16 +245,13 @@ function formatRateWindow(window, label) {
   const dur = formatDuration(d.cost?.total_duration_ms);
   if (dur) session.push(`${DIM}${dur}${RESET}`);
 
-  // ── Rate limits segment ────────────────────────────────────────────
+  // ── Rate limits segment ────────────────────────────────────────────────
   const rateParts = [
     formatRateWindow(d.rate_limits?.five_hour, '5h'),
     formatRateWindow(d.rate_limits?.seven_day, '7d'),
   ].filter(Boolean);
 
-  // ── Compaction segment ─────────────────────────────────────────────
-  const compactions = await compactionPromise;
-
-  // ── Assemble ───────────────────────────────────────────────────────
+  // ── Assemble ──────────────────────────────────────────────────────────
   const segments = [
     session.join(SEP),
     rateParts.length ? rateParts.join(`  `) : '',
